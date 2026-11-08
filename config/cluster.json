@@ -64,7 +64,7 @@
     ]
   },
   "host": {
-    "home": "/home/swank",
+    "home": "/home/masumi",
     "memguard_gib": 3,
     "memguard_interval_seconds": 2,
     "startup_memguard_gib": 5,
@@ -205,9 +205,9 @@
   },
   "deployment": {
     "launch_enabled": true,
-    "repository": "https://github.com/christopherowen/spark-ds41f.git",
-    "branch": "main",
-    "path": "{home}/projects/spark-ds41f",
+    "repository": "https://github.com/pju-hoge/spark-ds41f.git",
+    "branch": "site",
+    "path": "{home}/NewModels/spark-ds41f",
     "ready_url": "http://127.0.0.1:8000/v1/models",
     "ready_timeout_seconds": 3600
   },
