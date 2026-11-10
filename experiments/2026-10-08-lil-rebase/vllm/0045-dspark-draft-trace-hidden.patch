@@ -1,0 +1,146 @@
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432af0..6bb7ab73f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -205,6 +205,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DFlashSpeculator,
+     DraftBlockTableLayout,
+ )
++from vllm.v1.worker.gpu.spec_decode.dspark.trace import maybe_create_dspark_trace
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+     verify_supports_aux_hidden_states_over_pp,
+@@ -3744,6 +3745,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.adaptive_verification.record_confidences(
+                     confidences, input_batch, planned=planned_confidences
+                 )
++            if not hasattr(self, "_dspark_trace"):
++                self._dspark_trace = maybe_create_dspark_trace()
++            if self._dspark_trace is not None:
++                num_query = getattr(self.speculator, "num_query_per_req", None)
++                hidden = getattr(self.speculator, "hidden_states", None)
++                rows = (
++                    input_batch.num_reqs * num_query
++                    if hidden is not None and num_query
++                    else None
++                )
++                self._dspark_trace.record(
++                    input_batch.req_ids,
++                    sampler_output.sampled_token_ids,
++                    num_sampled,
++                    num_verified_draft_tokens,
++                    draft_tokens,
++                    confidences,
++                    hidden_states=hidden,
++                    num_tokens=rows,
++                )
+         elif self.speculator is not None:
+             draft_tokens_for_next_step = self.req_states.draft_tokens[
+                 input_batch.idx_mapping, :0
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+new file mode 100644
+index 000000000..64bc41786
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -0,0 +1,101 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-step DSpark draft trace (drafts, confidences, and drafter input).
++
++With ``SPARK3_DSPARK_TRACE=<path>``, TP rank 0 appends one JSON line per
++request per step: the tokens sampled this step, how many of the previous
++step's drafts were verified, the drafts and raw confidences proposed for the
++next step, and a window into the drafter's input buffer (the mean-pooled
++target aux hidden states that ``main_proj`` consumes).
++
++Hidden rows are written to ``<path>.hidden.f16`` as raw little-endian fp16 and
++referenced from the JSON line by offset, so the JSONL stays readable while the
++tensor dump stays compact. Set ``SPARK3_DSPARK_TRACE_EVERY=N`` to record only
++every Nth step (default 1).
++
++Tracing copies GPU tensors to the host each recorded step; use it for replay
++runs only, never for timing. Off unless the variable is set.
++"""
++
++import json
++import os
++
++import torch
++
++from vllm.distributed.parallel_state import get_tp_group
++
++_TRACE_PATH = os.environ.get("SPARK3_DSPARK_TRACE") or None
++_TRACE_EVERY = max(1, int(os.environ.get("SPARK3_DSPARK_TRACE_EVERY") or 1))
++
++
++class DSparkTrace:
++    def __init__(self, path: str) -> None:
++        self._file = open(path, "a", buffering=1 << 20)  # noqa: SIM115
++        self._hidden = open(path + ".hidden.f16", "ab", buffering=1 << 20)  # noqa: SIM115
++        self._offset = 0
++        self._step = 0
++
++    def record(
++        self,
++        req_ids: list[str],
++        sampled_token_ids: torch.Tensor,
++        num_sampled: torch.Tensor,
++        num_verified: torch.Tensor | None,
++        draft_tokens: torch.Tensor,
++        confidences: torch.Tensor | None,
++        hidden_states: torch.Tensor | None = None,
++        num_tokens: int | None = None,
++    ) -> None:
++        take = self._step % _TRACE_EVERY == 0
++        self._step += 1
++        if not take:
++            return
++
++        num_reqs = len(req_ids)
++        sampled = sampled_token_ids[:num_reqs].tolist()
++        counts = num_sampled[:num_reqs].tolist()
++        verified = (
++            num_verified[:num_reqs].tolist() if num_verified is not None else None
++        )
++        drafts = draft_tokens[:num_reqs].tolist()
++        confs = (
++            confidences[:num_reqs].float().tolist() if confidences is not None else None
++        )
++
++        hidden_ref = None
++        if hidden_states is not None:
++            rows = int(num_tokens if num_tokens is not None else hidden_states.shape[0])
++            rows = min(rows, hidden_states.shape[0])
++            block = hidden_states[:rows].detach().to("cpu", torch.float16).contiguous()
++            raw = block.numpy().tobytes()
++            self._hidden.write(raw)
++            hidden_ref = {
++                "off": self._offset,
++                "rows": rows,
++                "dim": int(hidden_states.shape[1]),
++            }
++            self._offset += len(raw)
++
++        common = {"t": self._step - 1, "b": num_reqs}
++        if hidden_ref is not None:
++            common["h"] = hidden_ref
++        for i, req_id in enumerate(req_ids):
++            record = dict(common)
++            record["r"] = req_id
++            record["s"] = sampled[i][: counts[i]]
++            record["d"] = drafts[i]
++            if verified is not None:
++                record["v"] = verified[i]
++            if confs is not None:
++                record["c"] = [round(c, 5) for c in confs[i]]
++            self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
++
++        if self._step % 256 == 0:
++            self._file.flush()
++            self._hidden.flush()
++
++
++def maybe_create_dspark_trace() -> DSparkTrace | None:
++    if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
++        return None
++    return DSparkTrace(_TRACE_PATH)
