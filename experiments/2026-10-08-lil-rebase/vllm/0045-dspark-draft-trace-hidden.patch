@@ -1,3 +1,13 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Mon, 10 Nov 2026 15:40:00 +0900
+Subject: [PATCH] dspark: per-step draft trace with drafter input dump
+
+Records drafts, confidences, verified counts and a window into the DSpark
+drafter's input buffer (mean-pooled target aux hidden states) per request
+per step when SPARK3_DSPARK_TRACE is set. Hidden rows go to a sibling
+.hidden.f16 file and are referenced from the JSON line by offset.
+---
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
 index 173432af0..6bb7ab73f 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
