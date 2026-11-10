@@ -38,6 +38,8 @@
       "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
     },
     "docker_run_args": [
+      "--env", "SPARK3_DSPARK_TRACE=/hub/dspark-trace/trace.jsonl",
+      "--env", "SPARK3_DSPARK_TRACE_EVERY=1",
       "--network=host",
       "--ipc=host",
       "--gpus=all",
@@ -77,8 +79,6 @@
     }
   },
   "environment": {
-    "SPARK3_DSPARK_TRACE": "/hub/dspark-trace/trace.jsonl",
-    "SPARK3_DSPARK_TRACE_EVERY": "1",
     "CUDA_CACHE_MAXSIZE": "4294967296",
     "CUDA_CACHE_PATH": "/cache/spark-ds41f/jit/nv-compute",
     "CUDA_DEVICE_MAX_CONNECTIONS": "32",
