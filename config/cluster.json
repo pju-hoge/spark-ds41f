@@ -30,7 +30,7 @@
     "name": "spark-ds41f",
     "image": "spark-ds41f:1110-trace",
     "expected_labels": {
-      "local.spark-ds41f.vllm.tree": "e4e3973c967dda8164da3a06fb1583a4cae7ebf8",
+      "local.spark-ds41f.vllm.tree": "4556ee25dd02145e2abcb3b730ddd2dc6f53f9be",
       "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark-ds41f.tilelang.tree": "e2b001828fd4e38e6a2eee61f818d5083cb1335f",
