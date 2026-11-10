@@ -1,23 +1,43 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: el-chan <el-chan@local>
-Date: Mon, 10 Nov 2026 18:35:00 +0900
-Subject: [PATCH] dspark: enable draft trace from a host-side marker file
+Date: Mon, 10 Nov 2026 18:55:00 +0900
+Subject: [PATCH] dspark: draft trace behind a marker, writing to /cache
 
-The launcher does not forward arbitrary --env flags, so an image-level
-marker file (/hub/dspark-trace/ENABLED) turns tracing on without one.
+/hub is a read-only bind, so the trace file goes under /cache (rw). A marker
+file enables it without env vars (the launcher drops arbitrary --env), and a
+failure to open the log disables tracing instead of breaking startup.
 ---
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
-index 64bc41786..00fe20fa5 100644
+index 00fe20fa5..6fbfb763c 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
-@@ -25,6 +25,10 @@ import torch
+@@ -25,10 +25,11 @@ import torch
  from vllm.distributed.parallel_state import get_tp_group
  
  _TRACE_PATH = os.environ.get("SPARK3_DSPARK_TRACE") or None
-+# A host-side marker enables tracing without an env var: this image is
-+# started by a launcher that does not forward arbitrary --env flags.
-+if _TRACE_PATH is None and os.path.exists("/hub/dspark-trace/ENABLED"):
-+    _TRACE_PATH = "/hub/dspark-trace/trace.jsonl"
+-# A host-side marker enables tracing without an env var: this image is
+-# started by a launcher that does not forward arbitrary --env flags.
+-if _TRACE_PATH is None and os.path.exists("/hub/dspark-trace/ENABLED"):
+-    _TRACE_PATH = "/hub/dspark-trace/trace.jsonl"
++# /hub is mounted read-only; the writable bind is /cache. A host-side
++# marker enables tracing without an env var (the launcher does not
++# forward arbitrary --env flags).
++if _TRACE_PATH is None and os.path.exists("/cache/dspark-trace/ENABLED"):
++    _TRACE_PATH = "/cache/dspark-trace/trace.jsonl"
  _TRACE_EVERY = max(1, int(os.environ.get("SPARK3_DSPARK_TRACE_EVERY") or 1))
  
  
+@@ -102,4 +103,12 @@ class DSparkTrace:
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
+     if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
+         return None
+-    return DSparkTrace(_TRACE_PATH)
++    try:
++        return DSparkTrace(_TRACE_PATH)
++    except Exception:  # tracing must never break startup
++        import logging
++
++        logging.getLogger(__name__).warning(
++            "DSparkTrace disabled: cannot open %s", _TRACE_PATH, exc_info=True
++        )
++        return None
