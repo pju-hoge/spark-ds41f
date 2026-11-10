@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Mon, 10 Nov 2026 20:45:00 +0900
+Subject: [PATCH] dspark: write the draft trace under /cache behind a marker
+
+/hub is a read-only bind, so the trace log goes to /cache (rw). A marker file
+enables tracing without env vars (the launcher drops arbitrary --env flags),
+and failing to open the log disables tracing instead of breaking startup.
+---
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 64bc417..6fbfb76 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -25,6 +25,11 @@ import torch
+ from vllm.distributed.parallel_state import get_tp_group
+ 
+ _TRACE_PATH = os.environ.get("SPARK3_DSPARK_TRACE") or None
++# /hub is mounted read-only; the writable bind is /cache. A host-side
++# marker enables tracing without an env var (the launcher does not
++# forward arbitrary --env flags).
++if _TRACE_PATH is None and os.path.exists("/cache/dspark-trace/ENABLED"):
++    _TRACE_PATH = "/cache/dspark-trace/trace.jsonl"
+ _TRACE_EVERY = max(1, int(os.environ.get("SPARK3_DSPARK_TRACE_EVERY") or 1))
+ 
+ 
+@@ -98,4 +103,12 @@ class DSparkTrace:
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
+     if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
+         return None
+-    return DSparkTrace(_TRACE_PATH)
++    try:
++        return DSparkTrace(_TRACE_PATH)
++    except Exception:  # tracing must never break startup
++        import logging
++
++        logging.getLogger(__name__).warning(
++            "DSparkTrace disabled: cannot open %s", _TRACE_PATH, exc_info=True
++        )
++        return None
