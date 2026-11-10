@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Mon, 10 Nov 2026 18:35:00 +0900
+Subject: [PATCH] dspark: enable draft trace from a host-side marker file
+
+The launcher does not forward arbitrary --env flags, so an image-level
+marker file (/hub/dspark-trace/ENABLED) turns tracing on without one.
+---
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 64bc41786..00fe20fa5 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -25,6 +25,10 @@ import torch
+ from vllm.distributed.parallel_state import get_tp_group
+ 
+ _TRACE_PATH = os.environ.get("SPARK3_DSPARK_TRACE") or None
++# A host-side marker enables tracing without an env var: this image is
++# started by a launcher that does not forward arbitrary --env flags.
++if _TRACE_PATH is None and os.path.exists("/hub/dspark-trace/ENABLED"):
++    _TRACE_PATH = "/hub/dspark-trace/trace.jsonl"
+ _TRACE_EVERY = max(1, int(os.environ.get("SPARK3_DSPARK_TRACE_EVERY") or 1))
+ 
+ 
