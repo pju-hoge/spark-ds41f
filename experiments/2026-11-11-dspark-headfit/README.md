@@ -204,3 +204,42 @@ step (more code, same effect).
   `config/cluster.json` before assuming a knob is free.
 - Host copies are illegal inside CUDA-graph capture — capture modes must be
   either graph-safe (pinned buffers) or run with graphs off.
+
+---
+
+## Breakthrough: `--enforce-eager` makes the drafter dump possible (2026-11-11 evening)
+
+The fourth attempt died on `Cannot copy between CPU and CUDA tensors during CUDA
+graph capture unless the CPU tensor is pinned`: `_sample_sequential` runs inside
+a CUDA-graph capture, so any `topk` + host copy there is illegal. The fix is not
+more code — it is to run the **capture boot with graphs off**:
+
+```
+serve_args += ["--enforce-eager"]
+speculative-config: enable_adaptive_verification=false   # the two are mutually exclusive
+                     adaptive_verification_row_cost removed (it requires adaptive verification)
+```
+
+With that, both halves of the pair land in one trace:
+
+```
+{"t":0,"b":16,"r":"...","s":[7],"d":[8,6,8,61,64],"c":[0,0,0,0,0],
+ "l":{"off":0,"rows":1,"k":64},          <- target top-k (k=64)
+ "dl":{"off":0,"rows":80,"k":32,"n":5}}  <- drafter pre-Markov top-k (k=32, n_spec=5)
+```
+
+Measured on the first working capture (40 requests, temperature 0.9):
+
+- 8,279 joined samples over 761 steps; **65.2 % of committed tokens are inside the
+  drafter's own top-32** — that is the ceiling any bias table can work with;
+- `fit_markov_head.py` (min 4 samples/prev, 5 epochs) lifts holdout argmax
+  agreement **81.68 % → 82.58 %**, touching only 417 of 129,280 rows.
+
+The adaptive-verification trade: the capture runs with fixed verification depth,
+so its acceptance rate (0.386) is not comparable to production (0.639). The
+*drafts and logits* are unaffected (the drafter samples greedily either way), so
+the fitting data is valid; only throughput/acceptance measurement needs the
+production config back.
+
+**Remember to revert both TEMP changes before serving.** They live in
+`config/cluster.json` as commits marked `exp(TEMP)`.
