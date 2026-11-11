@@ -368,3 +368,48 @@ The remaining headroom is model-level: DSpark's own top-1 is 55.6 % correct and
 its top-32 covers 65 % of the committed tokens, so a bias refit on 10× data (with
 `w2` and a margin loss) is the next lever that can move acceptance by more than a
 point or two.
+
+---
+
+## 3.6× more data for the refit: still no server-side gain (2026-11-12 00:xx)
+
+A second capture (867 prompts, 160 tokens, temperature 0.9) produced **135,083
+joined samples / 12,311 distinct `prev`** (the first run had 74,931 / 9,307).
+
+| fit | rows changed | holdout agreement |
+| --- | ---: | ---: |
+| shipped | — | 79.49 % |
+| CE, min 8 samples/prev | 2,171 | **82.11 % (+2.62 pt)** |
+| CE, min 4 | 4,045 | 81.90 % |
+| CE, min 2 | 7,000 | 81.72 % |
+| hinge (margin 1 nat) | 2,797 | 81.01 % (+0.07 pt) |
+
+The best offline fit (+2.62 pt) was deployed as overlay `fit-20261111c` on all
+four nodes (same tensor hash everywhere, verified) and served at row cost 0.065:
+
+| weights | acceptance (warm median) | acceptance length | gen tok/s |
+| --- | ---: | ---: | ---: |
+| shipped | **0.693** | 3.04 | 166 |
+| 135 k refit | 0.686 | 2.93 | 164 |
+
+**It did not transfer; it was slightly worse, so the shipped head is back.**
+Twice now the offline agreement gain (+1.88 pt, then +2.62 pt) has failed to
+become a server-side acceptance gain. The most likely cause is a distribution
+mismatch: the capture runs at temperature 0.9 (greedy verification produces no
+logits at temperature 0), while the acceptance A/B runs at temperature 0. The
+fit is then optimising the wrong distribution.
+
+## Where this leaves the goal
+
+Acceptance on this cluster today: **0.636 → 0.693 (+5.7 pt)**, bought entirely by
+the verifier's row cost, with throughput unchanged. The model-level levers tried
+so far (markov scale, top-2 branch, copy threshold, w1 refit at 1× and 3.6× data)
+are all exhausted or negative. What remains, in order of promise:
+
+1. **Make capture and evaluation agree**: capture at the temperature the service
+   actually runs at (or A/B at the capture temperature). Without this, every
+   head refit is measuring the wrong thing.
+2. **Fit `w2` too**, or fit `w1` with the target top-k *post*-bias scores rather
+   than the reconstructed pre-bias ones.
+3. **Drafter retraining / distillation** — the only lever that can move the 65 %
+   top-32 coverage, and out of scope for an evening.
