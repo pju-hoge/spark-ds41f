@@ -1,0 +1,397 @@
+From 542b2fba384dc7251832e2d924d19b53e0737eb7 Mon Sep 17 00:00:00 2001
+From: masumi <masumi@localhost>
+Date: Wed, 11 Nov 2026 12:48:14 +0900
+Subject: [PATCH] dspark: record the drafter's pre-Markov base logit top-k in
+ the draft trace
+
+The trace already keeps the target's top-k logits (the U_k the Markov head is
+fitted as a residual on). The drafter side of that residual was missing: the
+Markov bias is added to the drafter's own base logits, and those never left
+the GPU.
+
+Capture them in DSparkSpeculator._sample_sequential, right after the base
+logits are viewed as (num_reqs, n_spec, vocab) and before the Markov loop
+touches them: rows are (req, step) flattened, values float32, ids int32, k
+default 32. The vocabulary-parallel greedy path only reduces (max, index)
+shard pairs and never materialises full-vocabulary logits, so a captured step
+turns that path off and takes the dense compute_draft_logits route; the flag
+is False whenever the trace or the drafter dump is off, which is the default,
+and then the drafting path is bit-for-bit the one that ran before.
+
+DSparkTrace.record writes the block to <path>.drafttopk.f32/.i32, next to the
+target dump but in files of its own, and puts one dl block {off, rows, k, n}
+on the lines of that step. Width comes from SPARK3_DSPARK_TRACE_DRAFTTOPK or
+the /cache/dspark-trace/DRAFTTOPK marker (0 disables it), independent of the
+target dump's TOPK. A step that captured nothing records dx: 1 instead of
+inheriting the previous step's block.
+---
+ vllm/v1/worker/gpu/model_runner.py            |  23 +++
+ .../gpu/spec_decode/dspark/speculator.py      |  39 +++++
+ .../v1/worker/gpu/spec_decode/dspark/trace.py | 143 +++++++++++++++++-
+ 3 files changed, 198 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f24d20e53..9304b2d28 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -3478,6 +3478,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Cleared per step: a greedy step captures no logits, and must not
+             # inherit the block of the previous step.
+             self._dspark_logits_topk = None
++            if self.speculator is not None and hasattr(
++                self.speculator, "draft_trace_capture"
++            ):
++                # The drafter decides inside its own step whether this one is
++                # kept, so it cannot see the trace; hand it the decision.
++                self.speculator.draft_trace_capture = (
++                    self._dspark_trace.next_step_taken
++                )
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
+@@ -3789,6 +3797,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     else None
+                 )
+                 topk = getattr(self, "_dspark_logits_topk", None)
++                take_draft_topk = getattr(self.speculator, "take_draft_topk", None)
++                draft_topk = take_draft_topk() if take_draft_topk else None
++                draft_rows = draft_k = None
++                if draft_topk is not None:
++                    n_spec = self.speculator.num_speculative_steps
++                    draft_rows = input_batch.num_reqs * n_spec
++                    draft_k = int(draft_topk[0].shape[1])
+                 self._dspark_trace.record(
+                     input_batch.req_ids,
+                     sampler_output.sampled_token_ids,
+@@ -3800,6 +3815,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     num_tokens=rows,
+                     logits_topk=topk[0] if topk is not None else None,
+                     logits_cu=topk[1] if topk is not None else None,
++                    draft_topk=draft_topk,
++                    draft_rows=draft_rows,
++                    draft_k=draft_k,
++                    draft_n_spec=(
++                        self.speculator.num_speculative_steps
++                        if draft_topk is not None
++                        else None
++                    ),
+                 )
+         elif self.speculator is not None:
+             draft_tokens_for_next_step = self.req_states.draft_tokens[
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index da429c80d..1e9938aa4 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DFlashSpeculator,
+     DraftBlockTableLayout,
+ )
++from vllm.v1.worker.gpu.spec_decode.dspark import trace as dspark_trace
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+     greedy_markov_shard_pair,
+     markov_anchor_embed,
+@@ -189,6 +190,13 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.draft_model_config.hf_config, "dspark_draft_topk", None
+         )
+ 
++        # DSpark trace, drafter side: the runner sets ``draft_trace_capture``
++        # before ``propose`` when this step is one the trace keeps, and
++        # ``_sample_sequential`` leaves the pre-Markov top-k it captured for
++        # this step's drafts here for ``propose``'s caller to record.
++        self.draft_trace_capture: bool = False
++        self._dspark_draft_topk: tuple[torch.Tensor, torch.Tensor] | None = None
++
+         self.use_confidence_head: bool = False
+         self._top2_branch_margin: float = float(
+             getattr(
+@@ -510,7 +518,20 @@ class DSparkSpeculator(DFlashSpeculator):
+             return None
+         return table
+ 
++    def take_draft_topk(self) -> tuple[torch.Tensor, torch.Tensor] | None:
++        """The drafter's pre-Markov top-k captured for the step just drafted.
++
++        Handed to the trace once and cleared, so a block can never be recorded
++        twice or against another step.
++        """
++        block = self._dspark_draft_topk
++        self._dspark_draft_topk = None
++        return block
++
+     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++        # One shot per draft step: never let a previous step's capture reach
++        # this step's trace record.
++        self._dspark_draft_topk = None
+         if self._draft_topk is not None:
+             self._sample_sequential_topk(num_reqs, head_hidden)
+             return
+@@ -532,6 +553,19 @@ class DSparkSpeculator(DFlashSpeculator):
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+         vocab_parallel = self._vocab_parallel_greedy(local_head)
++        # DSpark trace (draft side): keep the pre-Markov base logits of these
++        # drafts. Full-vocabulary logits only exist on the dense path -- the
++        # vocabulary-parallel greedy path reduces (max, index) shard pairs and
++        # never materialises them -- so a captured step takes the dense path.
++        # ``want_draft_logits`` is False whenever the trace or its drafter dump
++        # is off (the default), and then not one line below changes.
++        want_draft_logits = (
++            dspark_trace.DRAFT_LOGITS_ENABLED
++            and not local_head
++            and self.draft_trace_capture
++        )
++        if want_draft_logits and vocab_parallel:
++            vocab_parallel = False
+         can_unfuse_markov = vocab_parallel and hasattr(self.model, "markov_bias_local")
+         tp_size = get_tensor_model_parallel_world_size() if can_unfuse_markov else 1
+         if local_head:
+@@ -544,6 +578,11 @@ class DSparkSpeculator(DFlashSpeculator):
+             base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
++        if want_draft_logits:
++            # Rows are (req, step), matching the ``d`` drafts of this step.
++            self._dspark_draft_topk = dspark_trace.capture_draft_logits(
++                base_logits, num_reqs, n_spec
++            )
+ 
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 761119f35..fca739c67 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Per-step DSpark draft trace (drafts, confidences, drafter input, target
+-top-k logits).
++"""Per-step DSpark draft trace (drafts, confidences, drafter input, target and
++drafter top-k logits).
+ 
+ With ``SPARK3_DSPARK_TRACE=<path>``, TP rank 0 appends one JSON line per
+ request per step: the tokens sampled this step, how many of the previous
+@@ -19,15 +19,29 @@ readable while the dumps stay compact:
+   (``l`` in the JSON line). These are the raw ``U_k`` before the Markov bias
+   is added, i.e. exactly the residual the drafter's Markov head is fitted
+   against.
++* ``<path>.drafttopk.f32`` and ``<path>.drafttopk.i32`` — top-k values and
++  vocabulary ids of the *drafter's* base logits for the drafts of the same
++  step, taken before the sequential Markov bias is added (``dl`` in the JSON
++  line). This is the drafter-side twin of ``l``: together they let the Markov
++  head be fitted as a residual on both sides of the loop. Rows are flattened
++  in ``(req, step)`` order: request ``i``'s draft position ``j`` is row
++  ``i * n_spec + j`` of the block, where ``n_spec`` is ``dl["n"]`` (the
++  drafter's configured depth) and ``dl["rows"]`` is ``num_reqs * n_spec``.
++  ``d`` of the same line holds the drafts that were actually scheduled, so
++  only the first ``len(d)`` positions of a request's block have a recorded
++  draft; the rest were drafted and then dropped by the scheduler.
+ 
+ Hidden rows are raw little-endian fp16. Top-k values are raw little-endian
+ fp32 and ids raw little-endian int32; a step writes ``rows * k`` of each, so
+-the two top-k files share one byte offset. Set ``SPARK3_DSPARK_TRACE_EVERY=N``
++each pair of top-k files shares one byte offset (the target pair and the
++drafter pair are separate files, each with its own offsets). Set ``SPARK3_DSPARK_TRACE_EVERY=N``
+ to record only every Nth step (default 1) and ``SPARK3_DSPARK_TRACE_TOPK`` to
+ change the number of logits kept per position (default 32; 0 disables the
+-logits dump). A step whose logits were never materialised (all-greedy
+-verification samples straight from the vocabulary shards) records ``lx: 1``
+-and no ``l``.
++logits dump), and ``SPARK3_DSPARK_TRACE_DRAFTTOPK`` (or the
++``/cache/dspark-trace/DRAFTTOPK`` marker) the same for the drafter's dump. A
++step whose logits were never materialised (all-greedy verification samples
++straight from the vocabulary shards) records ``lx: 1`` and no ``l``; one whose
++drafter logits were never materialised records ``dx: 1`` and no ``dl``.
+ 
+ Tracing copies GPU tensors to the host each recorded step; use it for replay
+ runs only, never for timing. Off unless the variable is set.
+@@ -70,6 +84,22 @@ _TRACE_TOPK = _topk_from_env()
+ LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_TOPK > 0
+ 
+ 
++def _drafttopk_from_env() -> int:
++    raw = (os.environ.get("SPARK3_DSPARK_TRACE_DRAFTTOPK") or "").strip()
++    if not raw:
++        return 32
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return 32
++
++
++# Logits kept per draft position on the drafter side. Deliberately separate
++# from _TRACE_TOPK: either dump can be recorded without the other.
++_TRACE_DRAFTTOPK = _drafttopk_from_env()
++DRAFT_LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_DRAFTTOPK > 0
++
++
+ def capture_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+     """The top-k ``(values, indices)`` of the target logits, kept on the GPU.
+ 
+@@ -84,6 +114,30 @@ def capture_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] |
+     return torch.topk(logits.detach(), k, dim=-1)
+ 
+ 
++def capture_draft_logits(
++    logits: torch.Tensor, num_reqs: int, n_spec: int
++) -> tuple[torch.Tensor, torch.Tensor] | None:
++    """The top-k ``(values, indices)`` of the drafter's *pre-Markov* logits.
++
++    ``logits`` is the ``(num_reqs, n_spec, vocab)`` base logits block the
++    sequential Markov loop adds its bias to, so row ``i * n_spec + j`` is
++    request ``i``'s draft position ``j``. ``topk`` allocates its own outputs
++    and leaves ``logits`` untouched, so the sampling that follows sees
++    bit-for-bit the tensor it would see without tracing. The host copy happens
++    later, in ``DSparkTrace.record``. Returns ``None`` when the dump is off.
++    """
++    if not DRAFT_LOGITS_ENABLED:
++        return None
++    rows = num_reqs * n_spec
++    if rows <= 0:
++        return None
++    flat = logits.detach().reshape(-1, logits.shape[-1])[:rows]
++    k = min(_TRACE_DRAFTTOPK, int(flat.shape[-1]))
++    if k <= 0:
++        return None
++    return torch.topk(flat, k, dim=-1)
++
++
+ def _row_ranges(
+     cu_num_logits: list[int] | None, num_reqs: int, rows: int
+ ) -> list[tuple[int, int]] | None:
+@@ -110,6 +164,9 @@ class DSparkTrace:
+         self._topk_values = None
+         self._topk_index = None
+         self._topk_offset = 0
++        self._draft_values = None
++        self._draft_index = None
++        self._draft_offset = 0
+         if LOGITS_ENABLED:
+             self._topk_values = open(  # noqa: SIM115
+                 path + ".topk.f32", "ab", buffering=1 << 20
+@@ -117,6 +174,13 @@ class DSparkTrace:
+             self._topk_index = open(  # noqa: SIM115
+                 path + ".topk.i32", "ab", buffering=1 << 20
+             )
++        if DRAFT_LOGITS_ENABLED:
++            self._draft_values = open(  # noqa: SIM115
++                path + ".drafttopk.f32", "ab", buffering=1 << 20
++            )
++            self._draft_index = open(  # noqa: SIM115
++                path + ".drafttopk.i32", "ab", buffering=1 << 20
++            )
+         self._step = 0
+ 
+     @property
+@@ -136,6 +200,10 @@ class DSparkTrace:
+         num_tokens: int | None = None,
+         logits_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
+         logits_cu: list[int] | None = None,
++        draft_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
++        draft_rows: int | None = None,
++        draft_k: int | None = None,
++        draft_n_spec: int | None = None,
+     ) -> None:
+         take = self.next_step_taken
+         self._step += 1
+@@ -184,6 +252,37 @@ class DSparkTrace:
+             topk_ranges = _row_ranges(logits_cu, num_reqs, rows)
+             self._topk_offset += len(raw_v)
+ 
++        # Drafter top-k: one block per recorded step, covering every request
++        # (rows are (req, step) flattened), so the JSON lines of a step share
++        # it rather than splitting it.
++        draft_block = None
++        if draft_topk is not None and self._draft_values is not None:
++            values, index = draft_topk
++            rows = int(draft_rows if draft_rows is not None else values.shape[0])
++            rows = min(rows, int(values.shape[0]))
++            k = int(draft_k if draft_k is not None else values.shape[1])
++            k = min(k, int(values.shape[1]))
++            raw_v = (
++                values[:rows, :k]
++                .to("cpu", torch.float32)
++                .contiguous()
++                .numpy()
++                .tobytes()
++            )
++            raw_i = (
++                index[:rows, :k]
++                .to("cpu", torch.int32)
++                .contiguous()
++                .numpy()
++                .tobytes()
++            )
++            self._draft_values.write(raw_v)
++            self._draft_index.write(raw_i)
++            draft_block = {"off": self._draft_offset, "rows": rows, "k": k}
++            if draft_n_spec:
++                draft_block["n"] = int(draft_n_spec)
++            self._draft_offset += len(raw_v)
++
+         common = {"t": self._step - 1, "b": num_reqs}
+         if hidden_ref is not None:
+             common["h"] = hidden_ref
+@@ -211,6 +310,14 @@ class DSparkTrace:
+                 # The step had no full-vocabulary logits (greedy verification
+                 # samples from the vocabulary shards directly).
+                 record["lx"] = 1
++            if draft_block is not None:
++                # Same block on every line of the step; dedupe by "off".
++                record["dl"] = dict(draft_block)
++            elif DRAFT_LOGITS_ENABLED:
++                # The step captured no drafter logits: its draft step replayed
++                # a FULL cuda graph (no Python runs there), or the drafter took
++                # its reduced-vocabulary or top-k-truncated path.
++                record["dx"] = 1
+             self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
+ 
+         if self._step % 256 == 0:
+@@ -219,6 +326,9 @@ class DSparkTrace:
+             if self._topk_values is not None:
+                 self._topk_values.flush()
+                 self._topk_index.flush()
++            if self._draft_values is not None:
++                self._draft_values.flush()
++                self._draft_index.flush()
+ 
+ 
+ def _topk_from_marker() -> int | None:
+@@ -239,14 +349,33 @@ def _topk_from_marker() -> int | None:
+         return None
+ 
+ 
++def _drafttopk_from_marker() -> int | None:
++    """``/cache/dspark-trace/DRAFTTOPK``: the drafter dump's width, same
++    marker channel as ``TOPK``. Absent, empty or unparsable means "keep the
++    environment/default value"."""
++    try:
++        with open("/cache/dspark-trace/DRAFTTOPK") as handle:
++            raw = handle.read().strip()
++    except OSError:
++        return None
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return None
++
++
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
+-    global _TRACE_TOPK, LOGITS_ENABLED
++    global _TRACE_TOPK, LOGITS_ENABLED, _TRACE_DRAFTTOPK, DRAFT_LOGITS_ENABLED
+     if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
+         return None
+     marker_topk = _topk_from_marker()
+     if marker_topk is not None and marker_topk != _TRACE_TOPK:
+         _TRACE_TOPK = marker_topk
+         LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_TOPK > 0
++    marker_draft = _drafttopk_from_marker()
++    if marker_draft is not None and marker_draft != _TRACE_DRAFTTOPK:
++        _TRACE_DRAFTTOPK = marker_draft
++        DRAFT_LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_DRAFTTOPK > 0
+     try:
+         return DSparkTrace(_TRACE_PATH)
+     except Exception:  # tracing must never break startup
+-- 
+2.43.0
+

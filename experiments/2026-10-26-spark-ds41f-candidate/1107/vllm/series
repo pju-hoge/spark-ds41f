@@ -644,3 +644,4 @@
 ../../../2026-10-08-lil-rebase/vllm/0047-dspark-trace-target-logits.patch
 ../../../2026-10-08-lil-rebase/vllm/0048-dspark-markov-scale.patch
 ../../../2026-10-08-lil-rebase/vllm/0049-dspark-trace-topk-marker.patch
+../../../2026-10-08-lil-rebase/vllm/0050-dspark-trace-draft-logits.patch
