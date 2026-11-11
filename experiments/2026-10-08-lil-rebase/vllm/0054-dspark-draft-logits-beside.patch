@@ -1,0 +1,58 @@
+From 34286dbb8b9d92d53e2d7698249966ae8b91d1a2 Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 14:45:43 +0900
+Subject: [PATCH] dspark: capture the drafter logits beside the production
+ path, not instead of it
+
+---
+ .../gpu/spec_decode/dspark/speculator.py      | 19 ++++++++-----------
+ 1 file changed, 8 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 998245862..6fbaab678 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -419,13 +419,7 @@ class DSparkSpeculator(DFlashSpeculator):
+         """Whether greedy drafts over the full target vocabulary stay sharded:
+         each rank reduces its shard and only (max, index) pairs are gathered."""
+         return (
+-            # The drafter dump needs the full-vocabulary logits the shard
+-            # reduction never materialises. Deciding it here (not only in
+-            # _sample_sequential) keeps the warm-up list and the executed path
+-            # consistent: the kernel cache is frozen after warm-up, so a path
+-            # chosen later would ask for unprepared kernels and fail startup.
+-            not dspark_trace.DRAFT_LOGITS_ENABLED
+-            and not local_head
++            not local_head
+             and getattr(self.model, "vocab_parallel_greedy", False)
+             and self.draft_logits is None
+             and self.model.draft_id_to_target_id is None
+@@ -570,8 +564,6 @@ class DSparkSpeculator(DFlashSpeculator):
+             and not local_head
+             and self.draft_trace_capture
+         )
+-        if want_draft_logits and vocab_parallel:
+-            vocab_parallel = False
+         can_unfuse_markov = vocab_parallel and hasattr(self.model, "markov_bias_local")
+         tp_size = get_tensor_model_parallel_world_size() if can_unfuse_markov else 1
+         if local_head:
+@@ -585,9 +577,14 @@ class DSparkSpeculator(DFlashSpeculator):
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+         if want_draft_logits:
+-            # Rows are (req, step), matching the ``d`` drafts of this step.
++            # Capture only: compute the full-vocabulary draft logits *beside*
++            # the production shard path, so sampling below keeps the exact
++            # kernels and tensors it uses without a trace. Forcing the dense
++            # path instead changed the kernels that run and faulted on TP4.
++            # Rows are (req, step), matching the drafts recorded this step.
++            cap = self.model.compute_draft_logits(sample_hidden)
+             self._dspark_draft_topk = dspark_trace.capture_draft_logits(
+-                base_logits, num_reqs, n_spec
++                cap.view(num_reqs, n_spec, cap.shape[-1]), num_reqs, n_spec
+             )
+ 
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+-- 
+2.43.0
+
