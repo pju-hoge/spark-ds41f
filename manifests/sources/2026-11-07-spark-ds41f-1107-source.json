@@ -4,7 +4,7 @@
   "vllm": {
     "base_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
     "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series",
-    "patchset_sha256": "2630d3c99a719998e5a9c0cfcf7fea4e810036136a4a175df15380be5ee4c265",
+    "patchset_sha256": "c32d89e438417da9033907f68b538d49325578dc32933866d2da529c9052ce41",
     "verification": "bin/spark build prepare applies the series to the pinned revision and checks this patch head and tree; image label local.spark-ds41f.vllm.tree matches",
     "capabilities": [
       "packed-bf16-lm-head",
@@ -127,9 +127,9 @@
       "ds41-serving-contract",
       "startup-allocator-heap-flush"
     ],
-    "patch_count": 650,
-    "patch_head": "4069424277734e02ab905a98a29eba0068277072",
-    "expected_tree": "227621ea413a8c1a12afd382fd7085b7742629ba"
+    "patch_count": 651,
+    "patch_head": "19bddb7fd6e2f9c6d5daf88a43792b317f1064c1",
+    "expected_tree": "3b542ef8a773b801ea3e951e2fb85996ec7f4f65"
   },
   "b12x": {
     "base_revision": "236ddff04a5f5064084b46464800b70b34ec7d8c",
