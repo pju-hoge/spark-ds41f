@@ -1,0 +1,32 @@
+From 957a0fadc723514293904f0973f88a73d8927aab Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 13:20:53 +0900
+Subject: [PATCH] dspark: take the dense draft path up front when the drafter
+ dump is on
+
+---
+ vllm/v1/worker/gpu/spec_decode/dspark/speculator.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 1e9938aa4..998245862 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -419,7 +419,13 @@ class DSparkSpeculator(DFlashSpeculator):
+         """Whether greedy drafts over the full target vocabulary stay sharded:
+         each rank reduces its shard and only (max, index) pairs are gathered."""
+         return (
+-            not local_head
++            # The drafter dump needs the full-vocabulary logits the shard
++            # reduction never materialises. Deciding it here (not only in
++            # _sample_sequential) keeps the warm-up list and the executed path
++            # consistent: the kernel cache is frozen after warm-up, so a path
++            # chosen later would ask for unprepared kernels and fail startup.
++            not dspark_trace.DRAFT_LOGITS_ENABLED
++            and not local_head
+             and getattr(self.model, "vocab_parallel_greedy", False)
+             and self.draft_logits is None
+             and self.model.draft_id_to_target_id is None
+-- 
+2.43.0
+
