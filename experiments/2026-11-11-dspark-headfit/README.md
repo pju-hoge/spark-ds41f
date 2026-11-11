@@ -289,3 +289,50 @@ the head is untouched; the fit also optimises agreement on a candidate set
 3. **Ranking objective**: a hinge loss on `logit(target) − logit(draft)` instead
    of softmax CE over the candidate set; the metric that matters is "does the
    argmax flip", not the likelihood over 33 candidates.
+
+---
+
+## Acceptance sweep: adaptive-verification row cost (2026-11-11 night)
+
+`adaptive_verification_row_cost` decides how many drafted rows the verifier keeps
+per step. Raising it prunes the rows least likely to be accepted, which raises
+the *reported* acceptance rate (accepted / verified) without changing the model.
+100 identical prompts, temperature 0, production config, warm runs only (the
+first run after a restart is 35 % slower and is excluded):
+
+| row cost | acceptance (median) | acceptance length | gen tok/s |
+| ---: | ---: | ---: | ---: |
+| 0.035 (shipped) | 0.636 | 3.18 | 166 |
+| **0.050** | 0.680 (+4.4 pt) | 3.11 | 168 |
+| **0.065** | **0.693 (+5.7 pt)** | 3.04 | **167** |
+| 0.080 | 0.715 (+7.9 pt) | 2.98 | 154 (−7 %) |
+
+**Decision: 0.065.** It buys +5.7 pt of acceptance with no throughput cost and
+only 0.14 tokens of acceptance length; 0.080 buys 2.2 pt more but starts paying
+in real speed. The variance of identical runs is ±0.6 pt, so all rows above are
+outside noise.
+
+Two things this sweep also settled:
+
+- **Copy drafts are the best drafts, not a problem.** On the production-mode
+  trace (171,063 steps, adaptive verification on): `dspark5` 92.6 % of steps at
+  73.9 % acceptance, `copy6-8` 82.4 %, **`copy9-16` 95.0 %**. Argon's suggestion
+  to fix/discard the copy path rested on a `pos5` figure that came from a
+  different subset; making copy rarer would lose the strongest drafts.
+- **`copy_drafts` is not reachable from the CLI** (`SpeculativeConfig` rejects
+  the key: "Not an option"), so the copy knobs (`min_match`, `max_drafts`,
+  `initial_drafts`, `PRIOR_HITS/TRIALS`) need a code default change and a rebuild.
+
+### Where the next real gain is
+
+The copy path proves the ceiling argument: when the continuation is *certain*
+(long suffix match) the drafts accept at 95 %. DSpark's own top-1 is only
+55.6 % correct and its top-32 coverage is 65 %, so logit-level tinkering is
+capped at +12 pt. The levers that can move much are therefore:
+
+1. make copy fire more often (lower `min_match` from 16, softer prior) — a
+   default change + rebuild, testable against the same replay;
+2. refit `w1`/`w2` on 10× data with a margin loss (queued);
+3. longer drafts, which currently cannot start: 8 drafts need
+   `long_prefill_token_threshold` lowered, and that value is a config template
+   variable defined outside `config/cluster.json`.
