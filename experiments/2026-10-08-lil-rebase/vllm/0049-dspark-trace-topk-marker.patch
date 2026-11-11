@@ -1,0 +1,50 @@
+From f70ce75e5d83ca14133d025f8ea79104a3f56b56 Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 10:19:46 +0900
+Subject: [PATCH] dspark: read the logits top-k width from
+ /cache/dspark-trace/TOPK
+
+---
+ .../v1/worker/gpu/spec_decode/dspark/trace.py | 23 +++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 330cbd732..761119f35 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -221,9 +221,32 @@ class DSparkTrace:
+                 self._topk_index.flush()
+ 
+ 
++def _topk_from_marker() -> int | None:
++    """``/cache/dspark-trace/TOPK``: the same marker channel as ENABLED.
++
++    Read when the trace is created, so the width of the logits dump can be
++    chosen per capture run without rebuilding the image. Absent, empty or
++    unparsable means "keep the environment/default value".
++    """
++    try:
++        with open("/cache/dspark-trace/TOPK") as handle:
++            raw = handle.read().strip()
++    except OSError:
++        return None
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return None
++
++
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
++    global _TRACE_TOPK, LOGITS_ENABLED
+     if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
+         return None
++    marker_topk = _topk_from_marker()
++    if marker_topk is not None and marker_topk != _TRACE_TOPK:
++        _TRACE_TOPK = marker_topk
++        LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_TOPK > 0
+     try:
+         return DSparkTrace(_TRACE_PATH)
+     except Exception:  # tracing must never break startup
+-- 
+2.43.0
+
