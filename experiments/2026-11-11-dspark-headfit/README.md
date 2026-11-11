@@ -336,3 +336,35 @@ capped at +12 pt. The levers that can move much are therefore:
 3. longer drafts, which currently cannot start: 8 drafts need
    `long_prefill_token_threshold` lowered, and that value is a config template
    variable defined outside `config/cluster.json`.
+
+---
+
+## Copy-draft knob sweep and the final setting (2026-11-11 late)
+
+Patch 0056 makes the copy knobs reachable without a rebuild
+(`/cache/dspark-trace/COPY_MINMATCH`, `COPY_INITIAL`, `COPY_MAXDRAFTS`, plus
+`COPY_PRIOR_HITS`/`COPY_PRIOR_TRIALS` in `tilelang_copy.py`); without a marker
+nothing changes. Image `spark-ds41f:1118-copyknob` carries it.
+
+| config | acceptance (median, warm) | acceptance length | gen tok/s |
+| --- | ---: | ---: | ---: |
+| `min_match` 16, row cost 0.065 | 0.693 | 3.04 | 167 |
+| `min_match` 8, row cost 0.065 | 0.689 | 3.05 | 167 |
+
+**No gain from making copy fire more often.** With the threshold at 16 the copy
+path already takes every long repeat it can find; 8-token matches are either
+rare or pruned by the verifier. The copy lever is exhausted at the default.
+
+### Final settings adopted today
+
+`adaptive_verification_row_cost = 0.065`, copy defaults untouched. Confirmed
+after removing the sweep marker (3 runs, warm medians):
+
+- acceptance **0.636 → 0.695 (+5.9 pt)**
+- acceptance length 3.18 → 3.06 (−0.12)
+- throughput 166 → 167 gen tok/s (unchanged)
+
+The remaining headroom is model-level: DSpark's own top-1 is 55.6 % correct and
+its top-32 covers 65 % of the committed tokens, so a bias refit on 10× data (with
+`w2` and a margin loss) is the next lever that can move acceptance by more than a
+point or two.
