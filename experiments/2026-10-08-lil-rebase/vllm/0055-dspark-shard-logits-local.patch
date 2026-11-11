@@ -1,0 +1,144 @@
+From b14850b2580f8c0f90d5bb51642b2586e4a735ad Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 16:11:20 +0900
+Subject: [PATCH] dspark: dump each rank's shard draft logits locally
+
+---
+ .../gpu/spec_decode/dspark/speculator.py      |   7 ++
+ .../v1/worker/gpu/spec_decode/dspark/trace.py | 102 ++++++++++++++++++
+ 2 files changed, 109 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 998245862..b5ecc85be 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -584,6 +584,13 @@ class DSparkSpeculator(DFlashSpeculator):
+             base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
++        # Per-rank draft-logit dump: read-only, no collective, and the sampling
++        # below is untouched. Each rank records its own vocabulary slice, which
++        # is exactly the tensor the Markov bias is added to.
++        if not local_head:
++            shard_trace = dspark_trace.maybe_create_shard_trace()
++            if shard_trace is not None:
++                shard_trace.record(base_logits, num_reqs, n_spec)
+         if want_draft_logits:
+             # Rows are (req, step), matching the ``d`` drafts of this step.
+             self._dspark_draft_topk = dspark_trace.capture_draft_logits(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 87b689cfd..5d5748253 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -393,6 +393,108 @@ def _hidden_from_marker() -> bool | None:
+     return None
+ 
+ 
++def _shardtopk_from_marker() -> int:
++    """``/cache/dspark-trace/SHARDTOPK``: width of the per-rank shard dump.
++
++    Every TP rank keeps its own vocabulary slice, so each rank can record the
++    top-k of the draft logits it already computed (``compute_draft_logits_local``)
++    without any collective and without changing the sampling path. Zero (or a
++    missing marker) disables it.
++    """
++    try:
++        with open("/cache/dspark-trace/SHARDTOPK") as handle:
++            raw = handle.read().strip()
++    except OSError:
++        return 0
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return 0
++
++
++class ShardTrace:
++    """Per-rank top-k of the shard-local draft logits, written to local files.
++
++    One block per draft step covering every request, rows ordered (req, step)
++    exactly like ``base_logits.view(num_reqs, n_spec, vocab)``. Rank ``r``
++    writes ``<path>.shard<r>.f32`` / ``.i32`` / ``.jsonl``, so no rank talks to
++    another; the merge happens offline on (block index, row).
++    """
++
++    def __init__(self, path: str, rank: int, k: int) -> None:
++        self._path = path
++        self._rank = rank
++        self._k = k
++        self._values = open(f"{path}.shard{rank}.f32", "ab", buffering=1 << 18)  # noqa: SIM115
++        self._index = open(f"{path}.shard{rank}.i32", "ab", buffering=1 << 18)  # noqa: SIM115
++        self._meta = open(f"{path}.shard{rank}.jsonl", "a", buffering=1 << 18)  # noqa: SIM115
++        self._offset = 0
++        self._step = 0
++
++    def record(self, logits: "torch.Tensor", num_reqs: int, n_spec: int) -> None:
++        if self._k <= 0:
++            return
++        flat = logits.detach().reshape(-1, logits.shape[-1])
++        rows = min(num_reqs * n_spec, int(flat.shape[0]))
++        if rows <= 0:
++            return
++        k = min(self._k, int(flat.shape[-1]))
++        values, index = torch.topk(flat[:rows], k, dim=-1)
++        raw_v = values.to("cpu", torch.float32).contiguous().numpy().tobytes()
++        raw_i = index.to("cpu", torch.int32).contiguous().numpy().tobytes()
++        self._values.write(raw_v)
++        self._index.write(raw_i)
++        import json as _json
++
++        self._meta.write(
++            _json.dumps(
++                {
++                    "t": self._step,
++                    "rank": self._rank,
++                    "off": self._offset,
++                    "rows": rows,
++                    "k": k,
++                    "n": n_spec,
++                    "vstart": 0,
++                },
++                separators=(",", ":"),
++            )
++            + "\n"
++        )
++        self._offset += len(raw_v)
++        self._step += 1
++        if self._step % 64 == 0:
++            self._values.flush()
++            self._index.flush()
++            self._meta.flush()
++
++
++_SHARD_TRACE: ShardTrace | None = None
++_SHARD_TRACE_READY = False
++
++
++def maybe_create_shard_trace() -> ShardTrace | None:
++    """The process-wide per-rank shard dump, or None when it is off."""
++    global _SHARD_TRACE, _SHARD_TRACE_READY
++    if _SHARD_TRACE_READY:
++        return _SHARD_TRACE
++    _SHARD_TRACE_READY = True
++    if _TRACE_PATH is None:
++        return None
++    width = _shardtopk_from_marker()
++    if width <= 0:
++        return None
++    try:
++        rank = get_tp_group().rank_in_group
++        _SHARD_TRACE = ShardTrace(_TRACE_PATH, rank, width)
++    except Exception:  # a dump must never break startup
++        import logging
++
++        logging.getLogger(__name__).warning("shard draft dump disabled", exc_info=True)
++        _SHARD_TRACE = None
++    return _SHARD_TRACE
++
++
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
+     global _TRACE_TOPK, LOGITS_ENABLED, _TRACE_HIDDEN, _TRACE_DRAFTTOPK, DRAFT_LOGITS_ENABLED
+     if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
+-- 
+2.43.0
+
