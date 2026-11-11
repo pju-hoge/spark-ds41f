@@ -199,7 +199,8 @@
     "--prefill-yield-limit-s",
     "10",
     "--per-request-spec-decode-metrics",
-    "summary"
+    "summary",
+    "--enforce-eager"
   ],
   "distributed": {
     "master_addr": "10.0.1.71",
