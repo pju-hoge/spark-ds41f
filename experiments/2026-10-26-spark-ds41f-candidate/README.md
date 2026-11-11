@@ -10,6 +10,10 @@ spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 [release notes](release-notes.md)). Previously released (2026-10-30): candidate 14 is
 `spark-ds41f-1030` on the ring and triangle ([below](#candidate-14-rc14)).
 
+**Frozen candidates (from 2026-11-10):** each merged base verified on all three testbeds is frozen,
+recorded in `manifests/frozen/`, tagged `spark-ds41f-candidate-<N>` and published as a GitHub pre-release; the
+next round's candidates are built on it ([release-benchmark](../../docs/release-benchmark.md#frozen-candidates-pre-releases)).
+
 **Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
 (6,417 passed, 163 skipped, 0 failed). **Candidate 8** ([below](#candidate-8-rc8)) adds 0533, the
 MoE output fix; its image is built and its release tests show two order-dependent test failures,
@@ -978,7 +982,7 @@ switchless `tp4-ring` and `tp3-triangle` (`dgx1..dgx4`), and switched `tp3-switc
 `tp8-switched` (`sp1..sp8`).
 
 - **Source & Image:** [1107/vllm/series](1107/vllm/series) (`641` active patches through `0761`,
-  `patch_head` `320021e3`, `expected_tree` `ed1bdb7a`, `patchset_sha256` `26fac4e5`) and
+  `patch_head` `2756478b`, `expected_tree` `ed1bdb7a`, `patchset_sha256` `26fac4e5`) and
   [1107/sparknet/series](1107/sparknet/series) (`3` active patches `0002..0004`, `patch_head`
   `1f84980b`, `expected_tree` `b86dc07f`, `patchset_sha256` `5394417f`); image `spark-ds41f:1107`
   (`sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce`).
@@ -990,3 +994,110 @@ switchless `tp4-ring` and `tp3-triangle` (`dgx1..dgx4`), and switched `tp3-switc
   `<3.46 GiB` (which tripped `spark-memguard`'s `4.0 GiB` startup floor during speculator capture)
   to `6.03..6.45 GiB` on head `sp5` and `7.94..8.10 GiB` on followers `sp6..sp7` across two boots.
 - **Full details:** see [1107/README.md](1107/README.md) and [release-notes.md](release-notes.md).
+
+## Candidate 47 ([candidate-47/](candidate-47))
+
+spark-ds41f-1107 plus #986, #966, #997, #1005, #965, #1012, #1016, #964, tested at `tp4-ring` (dgx1..dgx4). Candidates 47, 48 and 49
+are tested at the same time, one per testbed. The PRs that earn their keep are merged into the next
+candidate, which is qualified on all shapes. Marks, runs and rework rules are in its README.
+
+- **Series:** [candidate-47/vllm/series](candidate-47/vllm/series) (`0001..0769`, 649 patches;
+  `patchset_sha256` `d5160a07`, `patch_head` `fd03994c`, `expected_tree` `eb6f1070`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 48 ([candidate-48/](candidate-48))
+
+spark-ds41f-1107 plus #955, #1010, #980, #1013, #972, #1011, #973, tested at `tp4-switched` (sp1..sp4). Candidates 47, 48 and 49
+are tested at the same time, one per testbed. The PRs that earn their keep are merged into the next
+candidate, which is qualified on all shapes. Marks, runs and rework rules are in its README.
+
+- **Series:** [candidate-48/vllm/series](candidate-48/vllm/series) (`0001..0771`, 651 patches;
+  `patchset_sha256` `95a7270c`, `patch_head` `bd28dbf3`, `expected_tree` `fe5bddc4`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 49 ([candidate-49/](candidate-49))
+
+spark-ds41f-1107 plus #999, #993, #991, #1009, #979, #996, tested at `tp3-switched` (sp5..sp7). Candidates 47, 48 and 49
+are tested at the same time, one per testbed. The PRs that earn their keep are merged into the next
+candidate, which is qualified on all shapes. Marks, runs and rework rules are in its README.
+
+- **Series:** [candidate-49/vllm/series](candidate-49/vllm/series) (`0001..0767`, 647 patches;
+  `patchset_sha256` `ee85de7e`, `patch_head` `d0ee539e`, `expected_tree` `2eaad40f`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 50 ([candidate-50/](candidate-50))
+
+The merged base of candidates 47-49: spark-ds41f-1107 plus every PR that passed PR validation in candidates 47-49 (#966, #997, #965, #1012, #1016, #964, #955, #980, #1013, #972, #1011,
+#973, #999, #993, #991, #1009, #979, #996), each reworked PR as its corrected patch. It is verified, not release-qualified (the owner, 2026-11-09: dozens more PRs before a release), on `tp4-ring`, `tp4-switched` and `tp3-switched`. It is verified without #1009, which breaks the `tp4-ring` boot and is in rework. Sources, stacking and the runs are in its README.
+
+- **Series:** [candidate-50/vllm/series](candidate-50/vllm/series) (`0001..0780`, 660 patches;
+  `patchset_sha256` `38d230e9`, `patch_head` `ba7400d9`, `expected_tree` `d5778ab5`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 51 ([candidate-51/](candidate-51))
+
+candidate-50 without #1009 plus #961, #963, #987 (its WO-B part), #1001, tested at `tp4-ring` (dgx1..dgx4). Candidates 51, 52 and 53 are tested at the same time, one per testbed, on the accumulated base: candidate-50 without #1009, which is in rework. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README.
+
+- **Series:** [candidate-51/vllm/series](candidate-51/vllm/series) (`0001..0784`, 663 patches;
+  `patchset_sha256` `9fae6dc3`, `patch_head` `cc1115c5`, `expected_tree` `987ba058`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 52 ([candidate-52/](candidate-52))
+
+candidate-50 without #1009 plus #1030, #968, #969, tested at `tp4-switched` (sp1..sp4). Candidates 51, 52 and 53 are tested at the same time, one per testbed, on the accumulated base: candidate-50 without #1009, which is in rework. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #1030 changes temperature-0 output, so the gate checks #968 and #969 on its `no1030` control.
+
+- **Series:** [candidate-52/vllm/series](candidate-52/vllm/series) (`0001..0783`, 662 patches;
+  `patchset_sha256` `5ef94129`, `patch_head` `51a16b66`, `expected_tree` `1116740c`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 53 ([candidate-53/](candidate-53))
+
+candidate-50 without #1009 plus #960, #971, #977, #984, #998, tested at `tp3-switched` (sp5..sp7). Candidates 51, 52 and 53 are tested at the same time, one per testbed, on the accumulated base: candidate-50 without #1009, which is in rework. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. Its `build.json`, queued last, ends with the round's one release-test `kernel` job for all three.
+
+- **Series:** [candidate-53/vllm/series](candidate-53/vllm/series) (`0001..0785`, 664 patches;
+  `patchset_sha256` `f7f2d13c`, `patch_head` `62df12dc`, `expected_tree` `c0e25ff1`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 54 ([candidate-54/](candidate-54))
+
+The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that passed PR validation in candidates 51-53 (#961, #963, #987's WO-B part, #1001, #1030, #968, #969, #960, #971, #977, #998), each reworked PR as its corrected patch. #984 missed and is in rework, so it is left out; round 2 ends with #998 round 1. It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against 1107's recorded screens, and the carried fixes' live checks. Its screens are the next round's reference. #1030 changes temperature-0 text, so the gate's hashes differ from the 1017 checkpoint's by construction. Sources, stacking and the runs are in its README.
+
+- **Series:** [candidate-54/vllm/series](candidate-54/vllm/series) (`0001..0791`, 671 patches;
+  `patchset_sha256` `fd767123`, `patch_head` `4e8133ff`, `expected_tree` `5f021d9a`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 55 ([candidate-55/](candidate-55))
+
+candidate-54 plus #1008 (with its sparknet patch), #978, #988 (its dead-row part), tested at `tp4-ring` (dgx1..dgx4). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #995's guard is left out: its rework is bit-exact, but no serving path passes a negative slot to the kernels it guards.
+
+- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0794`, 674 patches;
+  `patchset_sha256` `6a1f3da3`, `patch_head` `410463b3`, `expected_tree` `e39b835c`) and
+  [candidate-55/sparknet/series](candidate-55/sparknet/series) (`0001` on 1107's pin; `patchset_sha256` `d58b3be5`,
+  `patch_head` `d50a1b4c`, `expected_tree` `dab8c457`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 56 ([candidate-56/](candidate-56))
+
+candidate-54 plus #957 (its part 1) and #956 round 3, tested at `tp4-switched` (sp1..sp4). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #956 round 3 builds on 957-p1, and its `no956` control isolates it on the same image.
+
+- **Series:** [candidate-56/vllm/series](candidate-56/vllm/series) (`0001..0796`, 673 patches;
+  `patchset_sha256` `0a6aa2ea`, `patch_head` `295c2ced`, `expected_tree` `0c848613`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 57 ([candidate-57/](candidate-57))
+
+candidate-54 plus #957 (its parts 2 and 4), tested at `tp3-switched` (sp5..sp7). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #957's part 5 is dropped after its rework. Its series has no `0795..0796`, which are candidate-56's.
+
+- **Series:** [candidate-57/vllm/series](candidate-57/vllm/series) (`0001..0798`, 673 patches;
+  `patchset_sha256` `5131e020`, `patch_head` `d74e38ee`, `expected_tree` `72b40d71`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 58 ([candidate-58/](candidate-58))
+
+The merged base of round 3: candidate-54 plus every PR that passed PR validation in candidates 55-57 (#1008 with its sparknet patch, #988's dead-row part, #956 r4, #957's parts 2 and 4), each reworked PR as its corrected patch, and TP3's L2 prefetch caps (15/12/12 MB, from candidate-54's cap sweep) as its own recipe variable. #978 fails the gate after its second rework (a third rework is under way by owner exception), #957's parts 1 and 5 and #984 are dropped, and #995's guard is inert, so they are left out. It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against candidate-54's recorded screens, and the carried fixes' live checks. Verified on all three, it becomes the first frozen candidate. Sources, stacking and the runs are in its README.
+
+- **Series:** [candidate-58/vllm/series](candidate-58/vllm/series) (`0001..0796`, 676 patches;
+  `patchset_sha256` `e22e7270`, `patch_head` `e5911bdf`, `expected_tree` `4815b7a0`) and
+  [candidate-58/sparknet/series](candidate-58/sparknet/series) (`0001` on 1107's pin; `patchset_sha256` `55c0ea53`,
+  `patch_head` `d50a1b4c`, `expected_tree` `dab8c457`).
+- **Status:** prepared and locked; not built, not measured.
