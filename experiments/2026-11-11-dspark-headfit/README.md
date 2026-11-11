@@ -147,3 +147,60 @@ post-bias, which can be converted to pre-bias with the shipped weights.
   rebuild, one-line rollback.
 - `~/scripts/dspark/markov_sweep.sh` + `capture_replay.py` — restart-per-point
   scale sweep and the temperature>0 replay that makes the target top-k appear.
+
+---
+
+## Fourth drafter-capture attempt: per-rank shard dumps (2026-11-11, after the
+Argon review)
+
+Argon (`gemini-4-argon-high`, report saved beside this file) found the decisive
+cause of attempt 3: the trace object exists **only on rank 0**
+(`dspark/trace.py:398`), and `model_runner.py` hands `draft_trace_capture` to the
+speculator only where that object exists — so rank 0 alone entered
+`compute_draft_logits()`, whose internal all-gather the other ranks never joined,
+and their context died (`CUDA_ERROR_LAUNCH_FAILED`). It also caught that
+`os.environ.setdefault("SPARKNET_ROCE_TIMEOUT_MS", ...)` was a no-op because
+`config/cluster.json:96` already sets that variable to `10000`.
+
+So the design became symmetric and collective-free (series 0055):
+
+- every rank takes `torch.topk` of the shard-local `base_logits` it has already
+  computed (`speculator.py:574`, `[num_reqs, 5, 32320]` FP32) and writes
+  `trace.jsonl.shard<r>.{f32,i32,jsonl}` into **its own** `/cache` — no rank
+  talks to another, no kernel changes, the sampling path is untouched;
+- `merge_shard_logits.py` rebuilds the global top-k offline
+  (`global_id = rank * 32320 + local_id`; 129,280 = 4 × 32,320 exactly) and
+  rewrites the rank-0 JSONL with a `dl` block, so `extract_draft_pairs.py` and
+  `analyze_hotspots` work unchanged. Verified on a hand-built 4-rank fixture:
+  the merged block picks rank 3's values first and reproduces global ids.
+
+**This attempt failed at startup**, but with a new and final root cause:
+
+```
+Cannot copy between CPU and CUDA tensors during CUDA graph capture
+unless the CPU tensor is pinned.
+```
+
+`_sample_sequential` runs inside a CUDA-graph capture during warm-up, so the
+`topk` + host copy there is illegal — the graph captures the *draft step*, not
+just the model forward. The kernel path and the rank symmetry were fine: the
+shard files were created on all four ranks (`shard0` … `shard3`) before the
+failure.
+
+### Next step (do this first next session)
+
+Run the capture **with `--enforce-eager`** added to `serve_args` for that boot
+only: no graph capture, so `_sample_sequential` is ordinary Python and the host
+copy is legal. Cost is throughput, which a capture run does not care about. The
+config line comes back out afterwards. Alternative if eager is undesirable: copy
+into a **pinned, preallocated** buffer inside the graph and flush it after the
+step (more code, same effect).
+
+### Lessons
+
+- A rank-0-only trace object silently makes any capture asymmetric; check
+  `rank_in_group` before hooking anything that takes part in a collective.
+- `os.environ.setdefault` loses to a value the launcher already set; read
+  `config/cluster.json` before assuming a knob is free.
+- Host copies are illegal inside CUDA-graph capture — capture modes must be
+  either graph-safe (pinned buffers) or run with graphs off.
