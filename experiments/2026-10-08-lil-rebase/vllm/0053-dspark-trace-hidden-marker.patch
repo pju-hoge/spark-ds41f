@@ -1,0 +1,73 @@
+From ed53b6bc398020f78b55e673a079bcf2eb2036de Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 14:11:38 +0900
+Subject: [PATCH] dspark: let the HIDDEN marker turn the drafter-input dump off
+
+---
+ .../v1/worker/gpu/spec_decode/dspark/trace.py | 29 +++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 98b6e0ad9..87b689cfd 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -86,6 +86,8 @@ def _topk_from_env() -> int:
+ 
+ # Logits kept per verification position. Zero disables the logits dump.
+ _TRACE_TOPK = _topk_from_env()
++# Drafter-input rows are dumped unless the HIDDEN marker turns them off.
++_TRACE_HIDDEN = True
+ # The runner's hot path checks this single bool: with tracing off, no extra
+ # work and no extra copy of any kind happens.
+ LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_TOPK > 0
+@@ -229,7 +231,7 @@ class DSparkTrace:
+         )
+ 
+         hidden_ref = None
+-        if hidden_states is not None:
++        if hidden_states is not None and _TRACE_HIDDEN:
+             rows = int(num_tokens if num_tokens is not None else hidden_states.shape[0])
+             rows = min(rows, hidden_states.shape[0])
+             block = hidden_states[:rows].detach().to("cpu", torch.float16).contiguous()
+@@ -371,14 +373,37 @@ def _drafttopk_from_marker() -> int | None:
+         return None
+ 
+ 
++def _hidden_from_marker() -> bool | None:
++    """/cache/dspark-trace/HIDDEN: 0 turns the drafter-input dump off.
++
++    The hidden rows are by far the largest host copy per step (num_reqs *
++    n_spec * 5120 * 2 B, ~0.8 GB at a profiling-sized batch). A run that only
++    fits the Markov head does not need them, and skipping the copy keeps rank 0
++    from stalling the other ranks' collectives.
++    """
++    try:
++        with open("/cache/dspark-trace/HIDDEN") as handle:
++            raw = handle.read().strip()
++    except OSError:
++        return None
++    if raw in ("0", "false", "False", "off"):
++        return False
++    if raw in ("1", "true", "True", "on"):
++        return True
++    return None
++
++
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
+-    global _TRACE_TOPK, LOGITS_ENABLED, _TRACE_DRAFTTOPK, DRAFT_LOGITS_ENABLED
++    global _TRACE_TOPK, LOGITS_ENABLED, _TRACE_HIDDEN, _TRACE_DRAFTTOPK, DRAFT_LOGITS_ENABLED
+     if _TRACE_PATH is None or get_tp_group().rank_in_group != 0:
+         return None
+     marker_topk = _topk_from_marker()
+     if marker_topk is not None and marker_topk != _TRACE_TOPK:
+         _TRACE_TOPK = marker_topk
+         LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_TOPK > 0
++    marker_hidden = _hidden_from_marker()
++    if marker_hidden is not None:
++        _TRACE_HIDDEN = marker_hidden
+     marker_draft = _drafttopk_from_marker()
+     if marker_draft is not None and marker_draft != _TRACE_DRAFTTOPK:
+         _TRACE_DRAFTTOPK = marker_draft
+-- 
+2.43.0
+
