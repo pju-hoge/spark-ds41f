@@ -28,9 +28,9 @@
   },
   "container": {
     "name": "spark-ds41f",
-    "image": "spark-ds41f:1113-draftpath",
+    "image": "spark-ds41f:1114-roce",
     "expected_labels": {
-      "local.spark-ds41f.vllm.tree": "90edc35e7a3bf7849d09bc7730c6ce8d77d018b7",
+      "local.spark-ds41f.vllm.tree": "781837d414c8a6dbf932953e925cab3462c2375e",
       "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark-ds41f.tilelang.tree": "e2b001828fd4e38e6a2eee61f818d5083cb1335f",
