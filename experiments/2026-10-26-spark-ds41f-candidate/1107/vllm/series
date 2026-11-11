@@ -648,4 +648,3 @@
 ../../../2026-10-08-lil-rebase/vllm/0051-dspark-draft-path-warmup.patch
 ../../../2026-10-08-lil-rebase/vllm/0052-dspark-trace-roce-timeout.patch
 ../../../2026-10-08-lil-rebase/vllm/0053-dspark-trace-hidden-marker.patch
-../../../2026-10-08-lil-rebase/vllm/0054-dspark-draft-logits-beside.patch
