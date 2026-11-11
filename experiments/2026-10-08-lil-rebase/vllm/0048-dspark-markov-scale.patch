@@ -1,0 +1,187 @@
+From 769a5d5584017e0a78fe9a167f3dc76577e18673 Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 09:55:51 +0900
+Subject: [PATCH 2/2] dspark: scale the Markov bias from
+ /cache/dspark-trace/MARKOV_SCALE
+
+Acceptance sweeps need to vary how strongly the Markov head pulls the draft
+distribution, without rebuilding or touching the weights. If
+/cache/dspark-trace/MARKOV_SCALE exists, its contents (one float, or one float
+per draft position, comma- or newline-separated) scale the Markov bias; if it
+does not, the bias is left exactly as it was.
+
+The scale multiplies the Markov embedding rather than the projected bias:
+bias = W2 @ embed is linear in the embedding, so this scales the bias
+identically for the dense projection, the vocabulary-parallel one and the
+fused greedy kernels, which never materialise a bias tensor. The scaled
+embedding is a separate tensor, so the embedding kept for the confidence head
+stays unscaled, and with no file loaded the helper returns the original
+tensor (no copy, no kernel).
+
+The file is read once, when the speculator is constructed. A missing, empty,
+malformed or non-finite file logs a warning and keeps the 1.0 default; loading
+never raises, so a bad sweep value cannot keep the server from starting.
+SPARK3_DSPARK_MARKOV_SCALE overrides the path.
+---
+ .../gpu/spec_decode/dspark/speculator.py      | 100 +++++++++++++++++-
+ 1 file changed, 95 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 710d549be..da429c80d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
+ backbone forward AND the sequential Markov sampling.
+ """
+ 
++import os
+ from collections.abc import Sequence
+ from typing import Any
+ 
+@@ -69,6 +70,69 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ logger = init_logger(__name__)
+ 
++# Runtime sweep knob for the Markov bias: one float, or one float per draft
++# position (comma- or newline-separated), read once at startup. Scaling the
++# Markov *embedding* scales the bias exactly — the head applies W2 to it
++# linearly — and works for every draft path, including the fused greedy
++# kernels that never materialise a bias tensor. A missing file keeps the
++# historical unscaled head, bit for bit.
++MARKOV_SCALE_PATH = os.environ.get(
++    "SPARK3_DSPARK_MARKOV_SCALE", "/cache/dspark-trace/MARKOV_SCALE"
++)
++
++
++def _load_markov_scale(path: str, num_steps: int) -> torch.Tensor | None:
++    """Per-draft-position Markov bias scales, or ``None`` for the default 1.0.
++
++    Never raises: a missing, empty, malformed or unreadable file leaves the
++    bias unscaled, so a bad sweep file can never keep the server from starting.
++    """
++    try:
++        with open(path) as f:
++            raw = f.read().strip()
++    except FileNotFoundError:
++        logger.warning("DSpark Markov scale: %s not found, using 1.0", path)
++        return None
++    except OSError:
++        logger.warning(
++            "DSpark Markov scale: cannot read %s, using 1.0", path, exc_info=True
++        )
++        return None
++    if not raw:
++        logger.warning("DSpark Markov scale: %s is empty, using 1.0", path)
++        return None
++    try:
++        values = [
++            float(part)
++            for part in raw.replace("\n", ",").split(",")
++            if part.strip()
++        ]
++    except ValueError:
++        logger.warning(
++            "DSpark Markov scale: %r is not a list of floats, using 1.0", raw
++        )
++        return None
++    if not values or not all(v == v and abs(v) != float("inf") for v in values):
++        logger.warning("DSpark Markov scale: %r has no finite values, using 1.0", raw)
++        return None
++    if len(values) < num_steps:
++        if len(values) > 1:
++            logger.warning(
++                "DSpark Markov scale: %d values for %d draft positions, "
++                "repeating the last",
++                len(values),
++                num_steps,
++            )
++        values = values + [values[-1]] * (num_steps - len(values))
++    values = values[:num_steps]
++    if all(v == 1.0 for v in values):
++        logger.warning(
++            "DSpark Markov scale: %s asks for 1.0, leaving the bias alone", path
++        )
++        return None
++    logger.warning("DSpark Markov scale: %s -> %s per draft position", path, values)
++    return torch.tensor(values, dtype=torch.float32)
++
+ 
+ def _needs_logits_for_acceptance(speculator: "DSparkSpeculator") -> bool:
+     """Whether ``acceptance_estimator`` reads full vocabulary draft logits.
+@@ -194,6 +258,31 @@ class DSparkSpeculator(DFlashSpeculator):
+             rank, dtype=torch.float32, device=device
+         )
+ 
++        # Acceptance-sweep knob: a runtime scale on the Markov bias (see
++        # ``_load_markov_scale``). None means "unscaled", the historical head.
++        self._markov_scale_dev = _load_markov_scale(
++            MARKOV_SCALE_PATH, self.num_speculative_steps
++        )
++        if self._markov_scale_dev is not None:
++            self._markov_scale_dev = self._markov_scale_dev.to(device)
++
++    def _markov_bias_embed(
++        self, markov_embed: torch.Tensor, step: int
++    ) -> torch.Tensor:
++        """``markov_embed`` with this draft position's Markov scale applied.
++
++        ``bias = W2 @ embed`` is linear in the embedding, so scaling the
++        embedding scales the bias — identically for the dense projection, the
++        vocabulary-parallel one and the fused greedy kernels that never
++        materialise a bias tensor. The scaling is a separate tensor, so the
++        copy kept for the confidence head stays unscaled. Returns the
++        embedding itself when no scale is loaded (no extra copy at all).
++        """
++        if self._markov_scale_dev is None:
++            return markov_embed
++        scale = self._markov_scale_dev[step].to(markov_embed.dtype)
++        return markov_embed * scale
++
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+         config = super().attn_vllm_config
+@@ -486,8 +575,9 @@ class DSparkSpeculator(DFlashSpeculator):
+                 markov_embed = self.model.markov_embed(prev)
+                 if self.use_confidence_head:
+                     confidence_markov_embeds.append(markov_embed)
++            markov_bias_embed = self._markov_bias_embed(markov_embed, i)
+             if local_head:
+-                bias = self.model.compute_local_markov_bias(markov_embed)
++                bias = self.model.compute_local_markov_bias(markov_bias_embed)
+                 if self.draft_logits is None and not _needs_logits_for_acceptance(self):
+                     draft_sampled_i = self.model.sample_local_draft_logits(
+                         base_logits[:, i], bias
+@@ -511,10 +601,10 @@ class DSparkSpeculator(DFlashSpeculator):
+                     # The Markov projection adds the base logits and reduces
+                     # this rank's shard: no bias tensor.
+                     self.model.markov_greedy_pairs_local(
+-                        markov_embed, base_logits[:, i], pairs, top2=use_top2
++                        markov_bias_embed, base_logits[:, i], pairs, top2=use_top2
+                     )
+                 else:
+-                    bias = self.model.markov_bias_local(markov_embed)
++                    bias = self.model.markov_bias_local(markov_bias_embed)
+                     greedy_markov_shard_pair(
+                         base_logits[:, i, :shard_vocab],
+                         bias[:, :shard_vocab],
+@@ -549,7 +639,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                 )
+                 prev = draft_sampled_i
+                 continue
+-            bias = self.model.markov_bias(markov_embed)
++            bias = self.model.markov_bias(markov_bias_embed)
+             if (
+                 self.draft_logits is None
+                 and self.model.draft_id_to_target_id is None
+@@ -629,7 +719,7 @@ class DSparkSpeculator(DFlashSpeculator):
+             if self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
+             logits_i = self.model.apply_markov_bias_gathered(
+-                markov_embed,
++                self._markov_bias_embed(markov_embed, i),
+                 base_logits[:, i],
+                 base_values[:, i],
+                 draft_indices[:, i],
+-- 
+2.43.0
+

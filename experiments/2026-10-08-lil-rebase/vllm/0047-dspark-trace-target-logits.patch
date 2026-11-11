@@ -1,0 +1,315 @@
+From 5d35d21818a4fa3fb186c219329e20383ffbfbfe Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 09:54:31 +0900
+Subject: [PATCH 1/2] dspark: record the target top-k logits in the draft trace
+
+The draft trace held the drafter input and the drafts, but not what the
+drafter is fitted against: the target (backbone) logits at each verified
+position, i.e. U_k before the Markov bias is added.
+
+sample() now keeps the top-k of the logits it just computed when the trace
+is open (default k=32, SPARK3_DSPARK_TRACE_TOPK). logits.topk allocates its
+own outputs and reads the logits, so sampling is bit-for-bit unchanged and
+with the trace off the capture is a single falsy module-level check: no
+copy, no kernel, no allocation. Greedy verification steps never materialise
+full-vocabulary logits; they record "lx": 1 instead of "l".
+
+The top-k goes to <path>.topk.f32 / <path>.topk.i32 (raw little-endian,
+rows * k per step, so both files share one byte offset); each JSON line
+carries its own slice as "l": {"off", "rows", "k"}, where off already
+includes the requests row offset from cu_num_logits.
+---
+ vllm/v1/worker/gpu/model_runner.py            |  40 +++++-
+ .../v1/worker/gpu/spec_decode/dspark/trace.py | 133 +++++++++++++++++-
+ 2 files changed, 165 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6bb7ab73f..f24d20e53 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -205,6 +205,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DFlashSpeculator,
+     DraftBlockTableLayout,
+ )
++from vllm.v1.worker.gpu.spec_decode.dspark import trace as dspark_trace
+ from vllm.v1.worker.gpu.spec_decode.dspark.trace import maybe_create_dspark_trace
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+@@ -2131,6 +2132,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 return output, output.num_sampled, output.num_rejected
+             input_batch.ensure_expanded_idx_mapping(self.input_buffers)
+             logits = self.model.compute_logits(sample_hidden_states)
++            self._capture_dspark_trace_logits(logits, input_batch)
+ 
+         if grammar_output is not None:
+             # Apply grammar bitmask to the logits in-place.
+@@ -2189,6 +2191,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         assert sampler_output is not None
+         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+ 
++    def _capture_dspark_trace_logits(
++        self, logits: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Keep this step's target top-k for the DSpark draft trace.
++
++        A no-op unless a trace is open. ``logits`` is never copied or modified:
++        the top-k allocates its own small tensor and the sampler keeps the full
++        logits, so tracing cannot change what is sampled. All-greedy steps
++        never reach here (they sample from the vocabulary shards), and
++        ``sample_tokens`` clears the capture each step, so a block from one step
++        is never recorded against another.
++        """
++        trace = getattr(self, "_dspark_trace", None)
++        if trace is None:
++            return
++        self._dspark_logits_topk = None
++        if not trace.next_step_taken:
++            return
++        topk = dspark_trace.capture_logits(logits)
++        if topk is None:
++            return
++        num_reqs = input_batch.num_reqs
++        self._dspark_logits_topk = (
++            topk,
++            [int(x) for x in input_batch.cu_num_logits_np[: num_reqs + 1]],
++        )
++
+     # Greedy verification from each rank's vocabulary shard (VLLM_GREEDY_VERIFICATION,
+     # on by default): see spec_decode/greedy_verification.py.
+     _greedy_verification: bool | None = None
+@@ -3443,6 +3472,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 for states in aux_hidden_states
+             ]
+ 
++        if not hasattr(self, "_dspark_trace"):
++            self._dspark_trace = maybe_create_dspark_trace()
++        if getattr(self, "_dspark_trace", None) is not None:
++            # Cleared per step: a greedy step captures no logits, and must not
++            # inherit the block of the previous step.
++            self._dspark_logits_topk = None
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
+@@ -3745,8 +3780,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.adaptive_verification.record_confidences(
+                     confidences, input_batch, planned=planned_confidences
+                 )
+-            if not hasattr(self, "_dspark_trace"):
+-                self._dspark_trace = maybe_create_dspark_trace()
+             if self._dspark_trace is not None:
+                 num_query = getattr(self.speculator, "num_query_per_req", None)
+                 hidden = getattr(self.speculator, "hidden_states", None)
+@@ -3755,6 +3788,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     if hidden is not None and num_query
+                     else None
+                 )
++                topk = getattr(self, "_dspark_logits_topk", None)
+                 self._dspark_trace.record(
+                     input_batch.req_ids,
+                     sampler_output.sampled_token_ids,
+@@ -3764,6 +3798,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     confidences,
+                     hidden_states=hidden,
+                     num_tokens=rows,
++                    logits_topk=topk[0] if topk is not None else None,
++                    logits_cu=topk[1] if topk is not None else None,
+                 )
+         elif self.speculator is not None:
+             draft_tokens_for_next_step = self.req_states.draft_tokens[
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index 6fbfb763c..330cbd732 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Per-step DSpark draft trace (drafts, confidences, and drafter input).
++"""Per-step DSpark draft trace (drafts, confidences, drafter input, target
++top-k logits).
+ 
+ With ``SPARK3_DSPARK_TRACE=<path>``, TP rank 0 appends one JSON line per
+ request per step: the tokens sampled this step, how many of the previous
+@@ -8,13 +9,32 @@ step's drafts were verified, the drafts and raw confidences proposed for the
+ next step, and a window into the drafter's input buffer (the mean-pooled
+ target aux hidden states that ``main_proj`` consumes).
+ 
+-Hidden rows are written to ``<path>.hidden.f16`` as raw little-endian fp16 and
+-referenced from the JSON line by offset, so the JSONL stays readable while the
+-tensor dump stays compact. Set ``SPARK3_DSPARK_TRACE_EVERY=N`` to record only
+-every Nth step (default 1).
++Tensor data lives in random-access side files written in lockstep with the
++JSON lines and referenced from them by byte offset, so the JSONL stays
++readable while the dumps stay compact:
++
++* ``<path>.hidden.f16`` — the drafter's input rows (``h`` in the JSON line).
++* ``<path>.topk.f32`` and ``<path>.topk.i32`` — top-k values and vocabulary
++  ids of the *target* (backbone) logits at every verification position
++  (``l`` in the JSON line). These are the raw ``U_k`` before the Markov bias
++  is added, i.e. exactly the residual the drafter's Markov head is fitted
++  against.
++
++Hidden rows are raw little-endian fp16. Top-k values are raw little-endian
++fp32 and ids raw little-endian int32; a step writes ``rows * k`` of each, so
++the two top-k files share one byte offset. Set ``SPARK3_DSPARK_TRACE_EVERY=N``
++to record only every Nth step (default 1) and ``SPARK3_DSPARK_TRACE_TOPK`` to
++change the number of logits kept per position (default 32; 0 disables the
++logits dump). A step whose logits were never materialised (all-greedy
++verification samples straight from the vocabulary shards) records ``lx: 1``
++and no ``l``.
+ 
+ Tracing copies GPU tensors to the host each recorded step; use it for replay
+ runs only, never for timing. Off unless the variable is set.
++
++The JSONL and its side files are appended to: start a run from an empty
++directory, or delete the JSONL and its side files together, so their offsets
++stay unambiguous.
+ """
+ 
+ import json
+@@ -33,13 +53,77 @@ if _TRACE_PATH is None and os.path.exists("/cache/dspark-trace/ENABLED"):
+ _TRACE_EVERY = max(1, int(os.environ.get("SPARK3_DSPARK_TRACE_EVERY") or 1))
+ 
+ 
++def _topk_from_env() -> int:
++    raw = (os.environ.get("SPARK3_DSPARK_TRACE_TOPK") or "").strip()
++    if not raw:
++        return 32
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return 32
++
++
++# Logits kept per verification position. Zero disables the logits dump.
++_TRACE_TOPK = _topk_from_env()
++# The runner's hot path checks this single bool: with tracing off, no extra
++# work and no extra copy of any kind happens.
++LOGITS_ENABLED = _TRACE_PATH is not None and _TRACE_TOPK > 0
++
++
++def capture_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
++    """The top-k ``(values, indices)`` of the target logits, kept on the GPU.
++
++    ``topk`` allocates its own outputs and leaves ``logits`` untouched, so the
++    sampler sees bit-for-bit the tensor it would see without tracing. The host
++    copy happens later, in ``DSparkTrace.record``. Returns ``None`` when the
++    logits dump is off.
++    """
++    if not LOGITS_ENABLED:
++        return None
++    k = min(_TRACE_TOPK, int(logits.shape[-1]))
++    return torch.topk(logits.detach(), k, dim=-1)
++
++
++def _row_ranges(
++    cu_num_logits: list[int] | None, num_reqs: int, rows: int
++) -> list[tuple[int, int]] | None:
++    """``(start row, row count)`` per request, or ``None`` when the split the
++    runner passed does not describe exactly ``rows`` logits rows."""
++    if cu_num_logits is None or len(cu_num_logits) < num_reqs + 1:
++        return None
++    if int(cu_num_logits[0]) != 0 or int(cu_num_logits[num_reqs]) != rows:
++        return None
++    ranges = []
++    for i in range(num_reqs):
++        start, end = int(cu_num_logits[i]), int(cu_num_logits[i + 1])
++        if end < start:
++            return None
++        ranges.append((start, end - start))
++    return ranges
++
++
+ class DSparkTrace:
+     def __init__(self, path: str) -> None:
+         self._file = open(path, "a", buffering=1 << 20)  # noqa: SIM115
+         self._hidden = open(path + ".hidden.f16", "ab", buffering=1 << 20)  # noqa: SIM115
+         self._offset = 0
++        self._topk_values = None
++        self._topk_index = None
++        self._topk_offset = 0
++        if LOGITS_ENABLED:
++            self._topk_values = open(  # noqa: SIM115
++                path + ".topk.f32", "ab", buffering=1 << 20
++            )
++            self._topk_index = open(  # noqa: SIM115
++                path + ".topk.i32", "ab", buffering=1 << 20
++            )
+         self._step = 0
+ 
++    @property
++    def next_step_taken(self) -> bool:
++        """Whether the step about to run is one ``record`` will keep."""
++        return self._step % _TRACE_EVERY == 0
++
+     def record(
+         self,
+         req_ids: list[str],
+@@ -50,8 +134,10 @@ class DSparkTrace:
+         confidences: torch.Tensor | None,
+         hidden_states: torch.Tensor | None = None,
+         num_tokens: int | None = None,
++        logits_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
++        logits_cu: list[int] | None = None,
+     ) -> None:
+-        take = self._step % _TRACE_EVERY == 0
++        take = self.next_step_taken
+         self._step += 1
+         if not take:
+             return
+@@ -81,6 +167,23 @@ class DSparkTrace:
+             }
+             self._offset += len(raw)
+ 
++        # Target top-k: one block per recorded step, each request's JSON line
++        # pointing at its own slice of it.
++        topk_block = None
++        topk_ranges = None
++        topk_k = 0
++        if logits_topk is not None and self._topk_values is not None:
++            values, index = logits_topk
++            rows = int(values.shape[0])
++            topk_k = int(values.shape[1])
++            raw_v = values.to("cpu", torch.float32).contiguous().numpy().tobytes()
++            raw_i = index.to("cpu", torch.int32).contiguous().numpy().tobytes()
++            self._topk_values.write(raw_v)
++            self._topk_index.write(raw_i)
++            topk_block = {"off": self._topk_offset, "rows": rows, "k": topk_k}
++            topk_ranges = _row_ranges(logits_cu, num_reqs, rows)
++            self._topk_offset += len(raw_v)
++
+         common = {"t": self._step - 1, "b": num_reqs}
+         if hidden_ref is not None:
+             common["h"] = hidden_ref
+@@ -93,11 +196,29 @@ class DSparkTrace:
+                 record["v"] = verified[i]
+             if confs is not None:
+                 record["c"] = [round(c, 5) for c in confs[i]]
++            if topk_block is not None:
++                if topk_ranges is not None:
++                    start, count = topk_ranges[i]
++                    record["l"] = {
++                        "off": topk_block["off"] + start * topk_k * 4,
++                        "rows": count,
++                        "k": topk_k,
++                    }
++                elif i == 0:
++                    # Unknown per-request split: hand out the whole block.
++                    record["l"] = dict(topk_block)
++            elif LOGITS_ENABLED:
++                # The step had no full-vocabulary logits (greedy verification
++                # samples from the vocabulary shards directly).
++                record["lx"] = 1
+             self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
+ 
+         if self._step % 256 == 0:
+             self._file.flush()
+             self._hidden.flush()
++            if self._topk_values is not None:
++                self._topk_values.flush()
++                self._topk_index.flush()
+ 
+ 
+ def maybe_create_dspark_trace() -> DSparkTrace | None:
+-- 
+2.43.0
+
