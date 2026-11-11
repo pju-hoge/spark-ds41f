@@ -1,0 +1,73 @@
+From bd023b657bce41916f653d1fdc77d2238671f2da Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 21:53:13 +0900
+Subject: [PATCH] copy drafts: read the sweep knobs from /cache markers
+
+---
+ vllm/config/speculative.py                    | 23 +++++++++++++++++++
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 15 ++++++++++--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index d7cf118ba..b311a0c67 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -410,6 +410,29 @@ class CopyDraftsConfig:
+     copy drafts were all accepted doubles it, up to ``max_drafts``, and a
+     rejected copy draft returns it here."""
+ 
++    def model_post_init(self, __context: object) -> None:
++        """Let a run override the copy knobs from /cache markers.
++
++        The fields are ``init=False`` (the object is built by
++        ``SpeculativeConfig``), so a sweep cannot pass them through the CLI. A
++        marker file keeps that sweep a restart instead of a rebuild; without the
++        marker nothing changes.
++        """
++        import os as _os
++
++        for field_name, path, floor in (
++            ("min_match", "/cache/dspark-trace/COPY_MINMATCH", 1),
++            ("initial_drafts", "/cache/dspark-trace/COPY_INITIAL", 1),
++            ("max_drafts", "/cache/dspark-trace/COPY_MAXDRAFTS", 1),
++        ):
++            try:
++                with open(path) as handle:
++                    value = int(handle.read().strip())
++            except (OSError, ValueError):
++                continue
++            value = max(floor, min(value, self.MAX_LEVEL))
++            object.__setattr__(self, field_name, value)
++
+     def levels(self) -> tuple[int, ...]:
+         """The suffix lengths compared, shortest first: ``min_match`` doubling
+         up to ``MAX_LEVEL``."""
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 32eab0055..1f0e1763e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -74,8 +74,19 @@ _SELECT_THREADS = 32
+ # The acceptance estimate: (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS), the
+ # counts decayed by DECAY at each verified copy, so a copy that starts is
+ # trusted at 0.95 and the estimate follows the request's last ten or so copies.
+-PRIOR_HITS = 19.0
+-PRIOR_TRIALS = 20.0
++def _marker_float(path: str, default: float) -> float:
++    """A float from a /cache marker, or ``default`` when it is absent."""
++    try:
++        with open(path) as handle:
++            return float(handle.read().strip())
++    except (OSError, ValueError):
++        return default
++
++
++# A sweep can soften the prior without a rebuild; the markers are read once at
++# import, before the kernels are warmed up.
++PRIOR_HITS = _marker_float("/cache/dspark-trace/COPY_PRIOR_HITS", 19.0)
++PRIOR_TRIALS = _marker_float("/cache/dspark-trace/COPY_PRIOR_TRIALS", 20.0)
+ DECAY = 0.9
+ # The cap doubles at most this many times (initial << 16 exceeds any lookahead).
+ MAX_DOUBLINGS = 16
+-- 
+2.43.0
+
