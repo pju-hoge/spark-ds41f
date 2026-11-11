@@ -169,7 +169,7 @@
     "--moe-backend",
     "tilelang",
     "--speculative-config",
-    "{\"method\":\"dspark\",\"num_speculative_tokens\":${drafts},\"draft_tensor_parallel_size\":${tensor_parallel_size},\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}",
+    "{\"method\":\"dspark\",\"num_speculative_tokens\":${drafts},\"draft_tensor_parallel_size\":${tensor_parallel_size},\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
     "--jit-monitor-mode",
     "off",
     "--compilation-config",
@@ -199,8 +199,7 @@
     "--prefill-yield-limit-s",
     "10",
     "--per-request-spec-decode-metrics",
-    "summary",
-    "--enforce-eager"
+    "summary"
   ],
   "distributed": {
     "master_addr": "10.0.1.71",
