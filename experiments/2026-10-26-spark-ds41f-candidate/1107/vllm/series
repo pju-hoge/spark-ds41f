@@ -646,3 +646,4 @@
 ../../../2026-10-08-lil-rebase/vllm/0049-dspark-trace-topk-marker.patch
 ../../../2026-10-08-lil-rebase/vllm/0050-dspark-trace-draft-logits.patch
 ../../../2026-10-08-lil-rebase/vllm/0051-dspark-draft-path-warmup.patch
+../../../2026-10-08-lil-rebase/vllm/0052-dspark-trace-roce-timeout.patch

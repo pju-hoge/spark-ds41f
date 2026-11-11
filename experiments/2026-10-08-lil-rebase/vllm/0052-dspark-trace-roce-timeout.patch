@@ -1,0 +1,30 @@
+From 61b34bd9a81ed9d1245e21d8fc2682070469065b Mon Sep 17 00:00:00 2001
+From: el-chan <el-chan@local>
+Date: Wed, 11 Nov 2026 13:50:18 +0900
+Subject: [PATCH] dspark: widen the RoCE relay timeout while the trace is open
+
+---
+ vllm/v1/worker/gpu/spec_decode/dspark/trace.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+index fca739c67..98b6e0ad9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/trace.py
+@@ -66,6 +66,13 @@ if _TRACE_PATH is None and os.path.exists("/cache/dspark-trace/ENABLED"):
+     _TRACE_PATH = "/cache/dspark-trace/trace.jsonl"
+ _TRACE_EVERY = max(1, int(os.environ.get("SPARK3_DSPARK_TRACE_EVERY") or 1))
+ 
++if _TRACE_PATH is not None:
++    # A capture run blocks rank 0 for seconds at a time (host copies, one-off
++    # TileLang compiles of the dense draft path). The RoCE relays abort a
++    # collective after 10 s by default, which turns that into a startup or
++    # decode failure for the other ranks. Widen the limit only while tracing.
++    os.environ.setdefault("SPARKNET_ROCE_TIMEOUT_MS", "600000")
++
+ 
+ def _topk_from_env() -> int:
+     raw = (os.environ.get("SPARK3_DSPARK_TRACE_TOPK") or "").strip()
+-- 
+2.43.0
+
