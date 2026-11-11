@@ -169,7 +169,7 @@
     "--moe-backend",
     "tilelang",
     "--speculative-config",
-    "{\"method\":\"dspark\",\"num_speculative_tokens\":${drafts},\"draft_tensor_parallel_size\":${tensor_parallel_size},\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035,\"copy_drafts\":{\"min_match\":64}}",
+    "{\"method\":\"dspark\",\"num_speculative_tokens\":${drafts},\"draft_tensor_parallel_size\":${tensor_parallel_size},\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
     "--jit-monitor-mode",
     "off",
     "--compilation-config",
