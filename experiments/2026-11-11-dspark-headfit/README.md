@@ -243,3 +243,49 @@ production config back.
 
 **Remember to revert both TEMP changes before serving.** They live in
 `config/cluster.json` as commits marked `exp(TEMP)`.
+
+---
+
+## First end-to-end fit and A/B (2026-11-11 night)
+
+Pipeline, all measured on `tp4-ring` with image `spark-ds41f:1117-shard`:
+
+1. **capture** — 300 replayed prompts at temperature 0.9 with `--enforce-eager`
+   (`ENABLED` + `TOPK=64` + `SHARDTOPK=32`, `HIDDEN=0`): 74,931 joined samples
+   over 4,345 steps, 9,307 distinct `prev` tokens, **65.0 % of committed tokens
+   inside the drafter's top-32**.
+2. **fit** — `fit_markov_head.py`, min 4 samples/prev, 10 epochs, lr 0.02:
+   holdout argmax agreement **80.94 % → 82.82 % (+1.88 pt)**, **2,787 of 129,280
+   rows changed** (2.2 % of the vocabulary; the rest had too few samples).
+3. **deploy** — `build_markov_overlay.py` produced a checkpoint overlay on every
+   node (`snapshots/fit-20261111b`), served by pointing
+   `models.v41-flash-1017.snapshot` at it. Note: the overlay's symlinks must be
+   **relative** (`../<orig-snapshot>/config.json`); absolute links resolve on the
+   host but not inside the container, where the hub is mounted at `/hub`.
+4. **A/B** — 100 identical prompts, temperature 0, production config
+   (adaptive verification on, no enforce-eager), warm runs:
+
+| | acceptance (median) | acceptance length | gen tok/s |
+| --- | --- | --- | --- |
+| shipped w1 (runs 2-3) | 0.636 | 3.18 | 166 |
+| fitted w1 (runs 2-3) | **0.639** | **3.22** | 158 |
+
+**Verdict: the offline gain does not translate into a server-side win yet.**
++0.3 pt acceptance and +0.04 acceptance length are inside the run-to-run spread
+(0.635-0.642 across identical shipped-weight runs). The production snapshot was
+left on the shipped weights.
+
+Why the ceiling is close: only 2.2 % of `w1` rows had ≥4 samples, so 97.8 % of
+the head is untouched; the fit also optimises agreement on a candidate set
+(drafter top-32 + committed token), not the verification outcome itself.
+
+### Next levers, in order of expected value
+
+1. **10× the capture** (≈3,000 requests): every `prev` token that appears often
+   enough gets a fitted row, and per-row sample counts go from a median of 2 to
+   ~20. Expect a materially different result before touching the objective.
+2. **Fit `w2` as well** (it is the same shape), or fit only `w1` rows for the
+   top-N frequent tokens with more epochs — dense rows are where the signal is.
+3. **Ranking objective**: a hinge loss on `logit(target) − logit(draft)` instead
+   of softmax CE over the candidate set; the metric that matters is "does the
+   argmax flip", not the likelihood over 33 candidates.
